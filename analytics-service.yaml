@@ -1,0 +1,182 @@
+# =============================================================================
+# MANIFESTO KUBERNETES — analytics-service  (com ESO)
+# Repositório: brunobaena/fase2-analytics-service
+# Cluster EKS: fase2-eks  |  Região: us-east-2  |  Account: 997739472885
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. NAMESPACE
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+  labels:
+    app.kubernetes.io/part-of: togglemaster
+    env: production
+
+---
+# -----------------------------------------------------------------------------
+# 2. SERVICEACCOUNT com anotação IRSA
+#    O EKS injeta automaticamente um token OIDC neste ServiceAccount.
+#    O AWS SDK lê o token e assume a role ToggleMaster-Analytics-Role,
+#    obtendo permissões para DynamoDB e SQS sem nenhuma chave de acesso.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: analytics-service-sa
+  namespace: analytics
+  labels:
+    app: analytics-service
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::997739472885:role/ToggleMaster-Analytics-Role"
+
+---
+# -----------------------------------------------------------------------------
+# 3. CONFIGMAP — variáveis NÃO-sensíveis
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: analytics-service-config
+  namespace: analytics
+  labels:
+    app: analytics-service
+data:
+  PORT: "8005"
+  AWS_REGION: "us-east-2"
+  AWS_DYNAMODB_TABLE: "ToggleMasterAnalytics"
+  AWS_SQS_URL: "https://sqs.us-east-2.amazonaws.com/997739472885/toogle-master-queue"
+
+---
+# -----------------------------------------------------------------------------
+# 4. DEPLOYMENT
+#    Nenhum Secret necessário — credenciais AWS vêm do IRSA automaticamente.
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-service
+  namespace: analytics
+  labels:
+    app: analytics-service
+    version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analytics-service
+  template:
+    metadata:
+      labels:
+        app: analytics-service
+        version: "1.0.0"
+    spec:
+      # Vincula o pod ao ServiceAccount com IRSA
+      serviceAccountName: analytics-service-sa
+
+      # Preferência de não colocar dois pods no mesmo nó (HA)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - analytics-service
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: analytics-service
+          image: 997739472885.dkr.ecr.us-east-2.amazonaws.com/fiap/analytics-service:1.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8005
+              protocol: TCP
+
+          # -----------------------------------------------------------------
+          # Variáveis NÃO-sensíveis — ConfigMap
+          # -----------------------------------------------------------------
+          env:
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: PORT
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_REGION
+            - name: AWS_DYNAMODB_TABLE
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_DYNAMODB_TABLE
+            - name: AWS_SQS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_SQS_URL
+
+          # -----------------------------------------------------------------
+          # Requests e Limits
+          # -----------------------------------------------------------------
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          # -----------------------------------------------------------------
+          # ReadinessProbe — o pod só recebe tráfego quando /health retornar 200
+          # -----------------------------------------------------------------
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          # -----------------------------------------------------------------
+          # LivenessProbe — reinicia o container se /health parar de responder
+          # -----------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 3
+
+      restartPolicy: Always
+
+---
+# -----------------------------------------------------------------------------
+# 5. SERVICE — ClusterIP
+# DNS interno: http://analytics-service.analytics.svc.cluster.local:8005
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-service
+  namespace: analytics
+  labels:
+    app: analytics-service
+spec:
+  type: ClusterIP
+  selector:
+    app: analytics-service
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8005
+      targetPort: 8005
