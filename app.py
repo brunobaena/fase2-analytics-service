@@ -48,7 +48,7 @@ def process_message(message):
     try:
         log.info(f"Processando mensagem ID: {message['MessageId']}")
         body = json.loads(message['Body'])
-        
+         
         # Gera um ID único para o item no DynamoDB
         event_id = str(uuid.uuid4())
         
@@ -75,8 +75,8 @@ def process_message(message):
             ReceiptHandle=message['ReceiptHandle']
         )
         
-    except json.JSONDecodeError:
-        log.error(f"Erro ao decodificar JSON da mensagem ID: {message['MessageId']}")
+    except json.JSONDecodeError as e:
+        log.error(f"Erro ao decodificar JSON da mensagem ID: {message['MessageId']} \n {message} \n {e}")
         # Não deleta a mensagem, pode ser uma "poison pill"
     except ClientError as e:
         log.error(f"Erro do Boto3 (DynamoDB ou SQS) ao processar {message['MessageId']}: {e}")
