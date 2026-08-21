@@ -76,20 +76,6 @@ spec:
       # Vincula o pod ao ServiceAccount com IRSA
       serviceAccountName: analytics-service-sa
 
-      # Preferência de não colocar dois pods no mesmo nó (HA)
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchExpressions:
-                    - key: app
-                      operator: In
-                      values:
-                        - analytics-service
-                topologyKey: kubernetes.io/hostname
-
       containers:
         - name: analytics-service
           image: 997739472885.dkr.ecr.us-east-2.amazonaws.com/fiap/analytics-service:1.0
@@ -180,3 +166,100 @@ spec:
       protocol: TCP
       port: 8005
       targetPort: 8005
+
+---
+# -----------------------------------------------------------------------------
+# 6. INGRESS
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: analytics-service-ingress
+  namespace: analytics
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /analytics(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: analytics-service
+                port:
+                  number: 8005
+
+---
+# =============================================================================
+# 7. KEDA — TriggerAuthentication
+# Usa podIdentity AWS (IRSA) com identityOwner: operator
+# O KEDA Operator autentica na AWS usando sua própria IRSA Role (KEDA-SQS-Role)
+# para consultar o queueDepth da fila SQS sem precisar de credenciais explícitas.
+# =============================================================================
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-sqs-trigger-auth
+  namespace: analytics
+spec:
+  podIdentity:
+    provider: aws
+
+---
+# =============================================================================
+# 8. KEDA — ScaledObject
+# Monitora a fila SQS "toogle-master-queue" e escala o analytics-service
+# de 0 (idle) até 5 réplicas com base no queueDepth.
+#
+# Lógica de escala:
+#   - Nenhuma mensagem na fila  → 0 pods (scale-to-zero)
+#   - A cada 5 msgs pendentes   → +1 pod (1 pod/5 mensagens)
+#   - Máximo                    → 5 pods
+#   - cooldownPeriod            → 300s antes de voltar ao zero
+#   - pollingInterval           → verifica a fila a cada 30s
+# =============================================================================
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: analytics-sqs-scaledobject
+  namespace: analytics
+  labels:
+    app: analytics-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: analytics-service
+
+  # --------------------------------------------------------------------------
+  # Réplicas
+  # --------------------------------------------------------------------------
+  minReplicaCount: 0   # scale-to-zero quando a fila estiver vazia
+  maxReplicaCount: 5   # limite superior
+
+  # --------------------------------------------------------------------------
+  # Intervalos
+  # --------------------------------------------------------------------------
+  pollingInterval:  30   # segundos entre cada verificação do queueDepth
+  cooldownPeriod:  300   # segundos de fila vazia antes de descer para 0
+
+  # --------------------------------------------------------------------------
+  # Trigger — AWS SQS
+  # --------------------------------------------------------------------------
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: keda-sqs-trigger-auth
+      metadata:
+        # URL completa da fila (evita ambiguidade de região)
+        queueURL: "https://sqs.us-east-2.amazonaws.com/997739472885/toogle-master-queue"
+        # Número de mensagens por pod (1 pod para cada 5 msgs na fila)
+        queueLength: "5"
+        awsRegion: "us-east-2"
+        identityOwner: operator
